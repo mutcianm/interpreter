@@ -31,7 +31,7 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     case New(_)                               => Value.instantiate(tree.tpe, env)
     case Ident(_)                             => env.lookup(tree.symbol) // q"$_" would've matched any tree, not just an ident
     case q"$qual.$_"                          => evalSelect(qual, tree.symbol, env)
-    case q"$qual.super[$_].$_"                => evalSelect(q"$qual.this", tree.symbol, env)
+//    case q"$qual.super[$_].$_"                => evalSelect(q"$qual.this", tree.symbol, env)
     case q"$_.this"                           => env.lookup(tree.symbol)
     case q"$expr.isInstanceOf[$tpt]()"        => evalTypeTest(expr, tpt.tpe, env)
     case q"$expr.asInstanceOf[$tpt]()"        => evalTypeCast(expr, tpt.tpe, env)
@@ -49,11 +49,14 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     // case q"{ case ..$cases }"              => never going to happen, because typer desugars these trees into anonymous class instantiations
     case q"while ($cond) $body"               => evalWhile(cond, body, env)
     case q"do $body while ($cond)"            => evalDoWhile(cond, body, env)
-    case q"{ ..$stats }"                      => evalBlock(stats, env)
+    case s: Super                             => eval(s.qual, env)
+    case q"{ ..$stats }"                      => evalBlock(tree.children, env) // FIXME: qq bug workaround(lazy value wrapper functions skipped in stats)
     // case q"for (..$enums) $expr"           => never going to happen, because parser desugars these trees into applications
     // case q"for (..$enums) yield $expr"     => never going to happen, because parser desugars these trees into applications
     // case q"new { ..$early } with ..$parents { $self => ..$stats }" => never going to happen in general case, desugared into selects/applications of New
-    case _: ValDef | _: ModuleDef | _: DefDef => evalLocal(tree, env) // can't skip these trees, because we need to enter them in scope when interpreting
+    case _: ValDef | _: DefDef                => evalLocal(tree, env) // can't skip these trees, because we need to enter them in scope when interpreting
+    case _: ModuleDef                         => evalModuleDef(tree, env)
+//    case _: ClassDef                          => evalClassDef(tree, env)
     case _: MemberDef                         => eval(q"()", env) // skip these trees, because we have sym.source
     case _: Import                            => eval(q"()", env) // skip these trees, because it's irrelevant after typer, which has resolved all imports
     case _                                    => UnrecognizedAst(tree)
@@ -116,14 +119,21 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
         // note how we bind ValDef's name to the default value of the corresponding type when evaluating the rhs
         // this is how Scala does it, so don't say that this looks weird :)
         val (vdefault, envx) = defaultValue(tpt.tpe)
-        eval(rhs, envx.extend(tree.symbol, vdefault))
-      case tree: ModuleDef =>
-        Value.module(tree.symbol.asModule, env)
+        val (res, env1) = eval(rhs, envx.extend(tree.symbol, vdefault))
+        res.copy(env1)
       case tree: DefDef =>
         Value.method(tree.symbol.asMethod, env)
     }
     val env2 = env.extendHeap(env1).extend(tree.symbol, vrepr)
-    Value.reflect((), env2)
+    (vrepr, env2)
+  }
+
+  def evalModuleDef(tree: Tree, env: Env): Result = {
+    Value.module(tree.symbol.asModule, tree.children.head.asInstanceOf[Template].body, env)
+  }
+
+  def evalClassDef(tree: Tree, env: Env): Result = {
+    Value.reflect((), env)
   }
 
   def evalAssign(lhs: Tree, rhs: Tree, env: Env): Result = {
@@ -132,9 +142,10 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     lhs match {
       case Ident(_) => // local value (things like `x` as in `this.x` have already been desugared by typer)
         val (vrhs, env1) = eval(rhs, env)
-        Value.reflect((), env1.extend(lhs.symbol, vrhs))
+        val (vrhsc, env2) = vrhs.copy(env1)
+        Value.reflect((), env2.extend(lhs.symbol, vrhsc))
       case Select(qual, _) => // someone's field
-        val (vlhs, env1) = eval(lhs, env)
+        val (vlhs, env1) = eval(qual, env)
         val (vrhs, env2) = eval(rhs, env1)
         Value.reflect((), env1.extend(vlhs, lhs.symbol, vrhs))
     }
@@ -150,7 +161,14 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
 
   def evalSelect(qual: Tree, sym: Symbol, env: Env): Result = {
     val (vqual, env1) = eval(qual, env)
-    vqual.select(sym, env1)
+    val (value, env2) = qual match {
+      case _:Super  => vqual.select(sym, env1, _super = true)
+      case _        => vqual.select(sym, env1)
+    }
+    value match {
+      case MethodValue(meth, _) if meth.paramLists.isEmpty => value.apply(Nil, env2)
+      case _                    => (value, env2)
+    }
   }
 
   def evalTypeTest(expr: Tree, tpe: Type, env: Env): Result = {
@@ -287,7 +305,7 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
   // can't make these classes final because of SI-4440
   sealed trait Slot
   case class Primitive(value: Any) extends Slot
-  case class Object(fields: ListMap[Symbol, Value]) extends Slot
+  case class Object(fields: Map[Symbol, Value]) extends Slot
   type Heap = ListMap[Value, Slot]
 
   type FrameStack = List[ListMap[Symbol, Value]]
@@ -299,17 +317,34 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
       // TODO: evaluate nullary methods
       // all the stuff above might be effectful
       // therefore we return Result here, and not just Value
-      (stack.head(sym), this)
+      sym match {
+        case m: ModuleSymbol                     => stack.head(sym).init(this)
+        case mc: ClassSymbol if mc.isModuleClass => stack.head(mc.module).init(this)
+        case _                                   => (stack.head(sym), this)
+      }
     }
     def extend(sym: Symbol, value: Value): Env = {
       stack.head.get(sym) match {
-        case Some(existing) => Env(stack, heap + (existing -> heap(value)))
+        case Some(v: ReifiableValue) => Env(stack, heap + (v -> heap(value)))
+        case Some(v: Value)          => Env(stack, heap) // TODO: what do with unreifiable values
         case None           => Env((stack.head + (sym -> value)) :: stack.tail, heap)
       }
     }
     def extend(obj: Value, field: Symbol, value: Value): Env = {
       // TODO: extend heap with the new value for the given field of the given object
-      ???
+      heap(obj) match {
+        case Object(fields) => extend(obj, Object(fields + (field -> value)))
+        case _              => IllegalState(obj)
+      }
+    }
+    def extend(obj: Value, newFields: Map[Symbol, Value]): Env = {
+      heap(obj) match {
+        case Object(fields) => extend(obj, Object(fields ++ newFields))
+        case _              => IllegalState(obj)
+      }
+    }
+    def extend(v: Value, s: Slot): Env = {
+      Env(stack, heap + (v -> s))
     }
     def extendHeap(other: Env): Env = {
       // import heap from another environment
@@ -320,6 +355,12 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     }
     def pushFrame(other: Env) = {
       Env(other.stack.head +: stack, heap)
+    }
+  }
+
+  class ObjectEnv(stack: FrameStack, heap: Heap, symbolMappings: Map[Symbol, Symbol]) extends Env(stack, heap) {
+    override def lookup(sym: Symbol): (Value, Env) = {
+      super.lookup(symbolMappings.getOrElse(sym, sym))
     }
   }
 
@@ -340,7 +381,7 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
         case None                  => IllegalState(this)
       }
     }
-    def select(member: Symbol, env: Env): Result = {
+    def select(member: Symbol, env: Env, _super: Boolean = false): Result = {
       // note that we need env here, because selection might be effectful
       // also note that there's no need to evaluate empty-arglist methods here
       // if we have an empty-arglist application, then the result of select will be fed into apply(Nil)
@@ -374,40 +415,188 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
       // TODO: also, we have to deal with all sort of conversions built into Scala: boxings, numeric stuff, nulls, etc
       ???
     }
+    def copy(env: Env): Result = (this, env)
+    def init(env: Env): Result = (this, env)
   }
 
-  class JvmValue() extends Value with MagicMethodEmulator {
-    override def select(member: Symbol, env: Env): Result = {
+  trait ReifiableValue
+
+  class JvmValue() extends Value with ReifiableValue with MagicMethodEmulator {
+    override def select(member: Symbol, env: Env, _super: Boolean = false): Result = {
       (selectCallable(this, member, env), env)
+    }
+    override def copy(env: Env) = {
+      val v = new JvmValue()
+      val (res, env1) = reify(env)
+      (v, env1.extend(v, res))
     }
     override def toString = s"JvmValue#" + id
   }
 
-  sealed trait CallableValue extends Value
+  sealed trait CallableValue extends Value {
+    override def reify(env: Env): (Any, Env) = {
+      val (res, env1) = apply(List(), env)
+      res.reify(env1)
+    }
+  }
 
   case class EmulatedCallableValue(f: (List[Value], Env) => Result) extends CallableValue {
     override def apply(args: List[Value], env: Env) = f(args, env)
   }
 
-  case class FunctionValue(params: List[Symbol], body: Tree, capturedEnv: Env) extends CallableValue {
+  case class FunctionValue(paramss: List[List[Symbol]], body: Tree, capturedEnv: Env) extends CallableValue {
     override def apply(args: List[Value], callSiteEnv: Env): Result = {
-      val env1 = callSiteEnv.pushFrame(capturedEnv).extendHeap(capturedEnv)
-      val env2 = params.zip(args).foldLeft(env1)((tmpEnv, p) => tmpEnv.extend(p._1, p._2))
-      val (res, env3) = eval(body, env2)
-      (res, callSiteEnv.extendHeap(env3))
+      val env1 = callSiteEnv.pushFrame(capturedEnv)
+      paramss match {
+        case x :: Nil => // single parameter list - invoke
+          val env2 = x.zip(args).foldLeft(env1)((tmpEnv, p) => tmpEnv.extend(p._1, p._2))
+          val (res, env3) = eval(body, env2)
+          (res, callSiteEnv.extendHeap(env3))
+        case x :: xs => // multi parameter list - return curried function with N-1 parameter list
+          val env2 = x.zip(args).foldLeft(env1)((tmpEnv, p) => tmpEnv.extend(p._1, p._2))
+          (FunctionValue(xs, body, env2), callSiteEnv.extendHeap(env2))
+        case _ =>      // empty paramlist - invoke without extending env
+          val (res, env3) = eval(body, env1)
+          (res, callSiteEnv.extendHeap(env3))
+      }
     }
 
-    override def select(member: Symbol, env: Env): Result = {
+    override def select(member: Symbol, env: Env, _super: Boolean = false): Result = {
       // for now we assume user cannot select methods other than apply from a function
       if (member.name.toString == "apply") (this, env) else ???
     }
+    override def toString = s"FunctionValue#" + id
   }
 
   case class MethodValue(sym: MethodSymbol, capturedEnv: Env) extends CallableValue {
     override def apply(args: List[Value], callSiteEnv: Env): Result = {
       val src = source(sym).asInstanceOf[DefDef].rhs
-      FunctionValue(sym.paramLists.head, src, capturedEnv.extend(sym, this)).apply(args, callSiteEnv)
+      FunctionValue(sym.paramLists, src, capturedEnv.extend(sym, this)).apply(args, callSiteEnv)
     }
+    override def toString = s"MethodValue#" + id
+  }
+
+  // a placeholder for java methods/methods with unobtainable source
+  case class DummyMethodValue(sym: MethodSymbol) extends CallableValue {
+    override def apply(args: List[Value], env: Env): (Value, Env) = {
+      Value.reflect((), env)
+    }
+    override def toString = s"DummyMethodValue#" + id
+  }
+
+  class ObjectValue(sym: Symbol, body: List[Tree]) extends Value {
+    var initialized = false
+    class ObjectCons(parent: ObjectValue, sym: MethodSymbol, capturedEnv: Env) extends MethodValue(sym, capturedEnv) {
+      def extractConsArgs(tree: MemberDef, args: List[List[ValDef]]): List[List[Symbol]] = {
+        // workaround constructor args symbol resolution bug
+        // extract symbols from valdefs of class body by name
+        // FIXME: there seems to be another bug, this time with names: an extra whitespace is appended to name in valdef symbol
+        val valDefs = tree.children.head.asInstanceOf[Template].body.collect({case d: ValDef => d}).map(it=>(it.name.toString.trim, it)).toMap
+        args.map(params => params.map(it => valDefs(it.name.toString).symbol))
+      }
+      override def apply(args: List[Value], env: Env): (Value, Env) = {
+        val (paramss, earlydefns, stats:List[Tree], parents) = source(sym.owner) match {
+          case q"$_ class $_[..$_] $_(...$paramss) extends { ..$earlydefns } with ..$parents { $_ => ..$stats }" =>
+            (paramss, earlydefns, stats, parents)
+        }
+        // map constructor args to object field symbols
+        val valDefs = extractConsArgs(source(sym.owner), paramss.asInstanceOf[List[List[ValDef]]])
+        val src = source(sym).asInstanceOf[DefDef].rhs
+        new ObjectConsFun(valDefs, src, capturedEnv, stats, parent).apply(args, env)
+      }
+    }
+    class ObjectConsFun(paramss: List[List[Symbol]], body: Tree, capturedEnv: Env, stats: List[Tree], parent: ObjectValue)
+      extends FunctionValue(paramss, body, capturedEnv) {
+      override def apply(args: List[Value], callSiteEnv: Env): (Value, Env) = {
+        // FIXME: deduplicate this using FunctionValue(note the differences: args->fields, body->body+stats, expr->parent)
+        val env1 = callSiteEnv.pushFrame(capturedEnv)
+        paramss match {
+          case x :: Nil => // single parameter list - invoke
+            val (_, env2) = eval(body, env1.extend(parent, x.zip(args).toMap))
+            val (res1, env3) = eval(stats, env2)
+            val env4 = env3.extend(parent, stats.map(_.symbol).zip(res1).toMap)
+            (parent, callSiteEnv.extendHeap(env4))
+          case x :: xs => // multi parameter list - return curried function with N-1 parameter list
+            val env2 = env1.extend(parent, x.zip(args).toMap)
+            (new ObjectConsFun(xs, body, env2, stats, parent), callSiteEnv.extendHeap(env2))
+          case _ =>      // empty paramlist - invoke without extending env
+            val (_, env2) = eval(body, env1)
+            val (res1, env3) = eval(stats, env2)
+            val env4 = env3.extend(parent, stats.map(_.symbol).zip(res1).toMap)
+            (parent, callSiteEnv.extendHeap(env4))
+        }
+      }
+    }
+    def selectOverride(member: Symbol, env: Env, _super: Boolean): Result = {
+      // for super calls we select member from a class symbol provided by member itself
+      // otherwise lookup a member from stored class symbol
+      val mem = if (_super)
+        member.owner.typeSignature.member(member.name)
+      else
+        sym.typeSignature.member(member.name)
+      env.heap.get(this) match {
+        case Some(Object(fields)) => (fields.getOrElse(mem, MethodValue(mem.asMethod, env)), env)
+        case Some(_: Primitive)   => IllegalState(this, "an object couldn't be a primitive")
+        case _ => IllegalState(this)
+      }
+    }
+    override def select(member: Symbol, env: Env, _super: Boolean = false): Result = {
+      // point all parent symbol references to this instance
+      val env1 = sym.typeSignature.baseClasses.foldLeft(env)((tmpEnv, parent) => tmpEnv.extend(parent, this))
+      env.heap.get(this) match {
+        // FIXME: we should emulate java.Object methods somehow
+        case _ if member.isJava   => (DummyMethodValue(member.asMethod), env)
+        case _ if member.isConstructor =>
+          (new ObjectCons(this, member.asMethod, env1.extend(sym, this)), env)
+        case _ if member.isMethod => selectOverride(member, env1, _super)
+        case Some(Object(fields)) =>
+          fields.get(member) match {
+            case Some(value)             => (value, env)
+            case _                       => IllegalState(member, "no such field")
+          }
+        case _                    => UninitializedObject(this)
+      }
+    }
+    override def toString = s"ObjectValue#" + id
+  }
+
+  case class ModuleValue(mod: ModuleSymbol, body: List[Tree]) extends ObjectValue(mod, body) {
+    override def select(member: Symbol, env: Env, _super: Boolean = false): (Value, Env) = {
+      val (_, env1) = init(env)
+      super.select(member, env.extendHeap(env1))
+    }
+    def collectFields(parents: List[Symbol], env: Env): (Map[Symbol, Value], Env) = {
+      parents match {
+        case x::xs =>
+          // java classes have no obtainable source
+          if (x.isJava) (Map(), env)
+          else {
+            // assuming result of baseClasses is correctly linearized
+            val (res1, env1) = collectFields(xs, env)
+            val body: List[Tree] = source(x) match {
+              case cd: ClassDef   => cd.children.head.asInstanceOf[Template].body
+              case md: ModuleDef  => md.children.head.asInstanceOf[Template].body
+              case other          => IllegalState(other)
+            }
+            val (res2: List[Value], env2) = eval(body, env1)
+            (body.map(_.symbol).zip(res2).toMap ++ res1, env2)
+          }
+        case _     => (Map(), env)
+      }
+    }
+    override def init(env: Env): (Value, Env) = {
+      if (initialized) {
+        (this, env)
+      } else {
+        initialized = true
+        val (inherited, env1) = collectFields(mod.typeSignature.baseClasses.filter(!_.isModuleClass),
+          mod.typeSignature.baseClasses.foldLeft(env)((tmpEnv, s) => tmpEnv.extend(s, this)))
+        val (res: List[Value], env2) = eval(body, env1.extend(mod, this))
+        val env3 = env.extendHeap(env2).extend(this, Object(inherited ++ body.map(_.symbol).zip(res).toMap))
+        (this, env3)
+      }
+    }
+    override def toString = s"ModuleValue#" + id
   }
 
   object Value {
@@ -421,16 +610,18 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     def function(params: List[Tree], body: Tree, env: Env): Result = {
       // wrap a function in an interpreter value using the provided lexical environment
       // note how useful it is that Env is immutable!
-      (FunctionValue(params.map(_.symbol), body, env), env)
+      (FunctionValue(List(params.map(_.symbol)), body, env), env)
     }
     def instantiate(tpe: Type, env: Env): Result = {
       // TODO: instantiate a type (can't use ClassSymbol instead of Type, because we need to support polymorphic arrays)
       // not sure whether we need env, because we don't actually call the constructor here, but let's have it just in case
-      ???
+      val v = new ObjectValue(tpe.typeSymbol, source(tpe.typeSymbol).children.head.asInstanceOf[Template].body)
+      (v, env.extend(tpe.typeSymbol, v).extend(v, new Object(Map())))
     }
-    def module(mod: ModuleSymbol, env: Env): Result = {
+    def module(mod: ModuleSymbol, children: List[Tree], env: Env): Result = {
       // TODO: create an interpreter value that corresponds to the object represented by the symbol
-      ???
+      val value = ModuleValue(mod, children)
+      (value, env.extend(mod, value))
     }
     def method(meth: MethodSymbol, env: Env): Result = {
       (MethodValue(meth, env), env)

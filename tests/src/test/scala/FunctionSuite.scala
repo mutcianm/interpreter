@@ -44,5 +44,21 @@ class FunctionSuite extends FunSuite{
       g(40)(2)
     } == 42)
   }
+  
+  test("multiple parameter list simple") {
+    assert(ctfe { def f(a:Int)(b:Int) = a+b; f(40)(2) } == 42)
+  }
+  
+  test("multiple parameter list currying") {
+    assert(ctfe {
+      def f(a:Int)(b:Int) = a+b
+      val g = f(40)(_)
+      g(2)
+    } == 42)
+  }
+
+  test("zero paremeter list") {
+    assert(ctfe { def f = 42; f } == 42)
+  }
 
 }

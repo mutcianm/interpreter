@@ -1,7 +1,11 @@
 import org.scalatest.FunSuite
 
 class BasicSuite extends FunSuite {
-	
+
+  test("unit value") {
+    assert(ctfe { ()  } == ())
+  }
+
   test("evaluates 42") {
     assert(ctfe(42) === 42)
   }
@@ -27,7 +31,11 @@ class BasicSuite extends FunSuite {
   }
 
   test("if test") {
-    assert(ctfe({val a = 10; val b = 5; if (a == b+5) "ok" else "notOk"}) == "ok")
+    assert(ctfe({val a = 10;  val b = 5; if (a == b+5) "ok" else "notOk"}) == "ok")
+  }
+
+  test("value dependency test") {
+    assert(ctfe { var a = 99; val b = a; a = 42;  b } == 99)
   }
 
 }

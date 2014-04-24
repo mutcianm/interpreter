@@ -17,9 +17,11 @@ trait Errors {
 
   def UnreifiableResult(value: Value) = sys.error(s"can't reify evaluation result $value")
 
+  def UninitializedObject(value: Value) = sys.error(s"can't access field of an uninitialized ojbect $value")
+
   def RuntimeReflectionNotSupported(tree: Tree) = sys.error(s"runtime reflection is not supported: $tree")
 
   def UnsupportedEmulation(symbol: Symbol) = sys.error(s"emulation of symbol ${showDecl(symbol)} is not supported")
 
-  def IllegalState(culprit: Any) = sys.error(s"Emulator ended up in illegal state, culprit: $culprit")
+  def IllegalState(culprit: Any, details: String = "") = sys.error(s"Emulator ended up in illegal state($details), culprit: $culprit")
 }
