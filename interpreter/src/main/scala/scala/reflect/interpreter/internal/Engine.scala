@@ -4,7 +4,7 @@ package internal
 import scala.annotation.tailrec
 import scala.collection.immutable.ListMap
 
-abstract class Engine extends InterpreterRequires with Definitions with Errors with Emulators {
+abstract class Engine extends InterpreterRequires with Definitions with Errors with Emulators with ReflectionObjectFactory {
   import u._
   import definitions._
   import internal.decorators._
@@ -134,7 +134,8 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     tree.symbol.owner match {
       case cd:ClassSymbol =>
         val (instance, env2) = env1.lookup(cd)
-        (vrepr, env.extendHeap(env2).extend(instance, tree.symbol, vrepr))
+        instance.extend(tree.symbol, vrepr, env.extendHeap(env2))
+//        (vrepr, env.extendHeap(env2).extend(instance, tree.symbol, vrepr))
       case _              =>
         (vrepr, env.extendHeap(env1).extend(tree.symbol, vrepr))
     }
@@ -155,7 +156,8 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
       case Select(qual, _) => // someone's field
         val (vlhs, env1) = eval(qual, env)
         val (vrhs, env2) = eval(rhs, env1)
-        Value.reflect((), env1.extendHeap(env2).extend(vlhs, lhs.symbol, vrhs))
+        vlhs.extend(lhs.symbol, vrhs, env1.extendHeap(env2))
+//        Value.reflect((), env1.extendHeap(env2).extend(vlhs, lhs.symbol, vrhs))
     }
   }
 
@@ -168,11 +170,13 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
   }
 
   def evalSelect(qual: Tree, sym: Symbol, env: Env): Result = {
-    val (vqual, env1) = eval(qual, env)
-    val (value, env2) = qual match {
-      case _:Super  => vqual.select(sym, env1, static = true)
-      case _        => vqual.select(sym, env1)
-    }
+    val (value, env2) = if (qual.symbol == null || !qual.symbol.isPackage) {
+      val (vqual, env1) = eval(qual, env)
+      qual match {
+        case _: Super => vqual.select(sym, env1, static = true)
+        case _ => vqual.select(sym, env1)
+      }
+    } else Value.module(sym.asModule, env)
     value match {
       case MethodValue(meth, _) if meth.paramLists.isEmpty => value.apply(Nil, env2)
       case _                    => (value, env2)
@@ -323,7 +327,6 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     def lookup(sym: Symbol): Result = {
       // all the stuff above might be effectful
       // therefore we return Result here, and not just Value
-      // TODO: reflect java modules to call things like System.getenv() etc.
       val mod = if (sym.isModule) sym.asModule else if (sym.isClass && sym.isModuleClass) sym.asClass.module else sym
       mod match {
         case m: ModuleSymbol                     =>
@@ -386,7 +389,7 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
   @volatile private var _nextId = new java.util.concurrent.atomic.AtomicInteger()
   private def nextId() = _nextId.incrementAndGet()
 
-  sealed trait Value extends MagicMethodEmulator {
+  trait Value extends MagicMethodEmulator {
     val id = nextId()
     def reify(env: Env): JvmResult = {
       // convert this interpreter value to a JVM value
@@ -433,6 +436,10 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     }
     def copy(env: Env): Result = (this, env)
     def init(env: Env): Result = (this, env)
+    def extend(field: Symbol, v: Value, env: Env): Result = {
+      // allow values to override behaviour of object field handling
+      ???
+    }
     val tpt: Type = typeOf[Any]
   }
 
@@ -449,7 +456,7 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     override def toString = s"JvmValue#" + id
   }
 
-  sealed trait CallableValue extends Value {
+  trait CallableValue extends Value {
   }
 
   case class EmulatedCallableValue(f: (List[Value], Env) => Result) extends CallableValue {
@@ -582,6 +589,9 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
         case _                         => UninitializedObject(this)
       }
     }
+    override def extend(field: Symbol, v: Value, env: Env): (Value, Env) = {
+      (v, env.extend(this, field, v))
+    }
     override def toString = s"ObjectValue#" + id
   }
   
@@ -641,13 +651,18 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     def instantiate(tpe: Type, env: Env): Result = {
       // TODO: instantiate a type (can't use ClassSymbol instead of Type, because we need to support polymorphic arrays)
       // not sure whether we need env, because we don't actually call the constructor here, but let's have it just in case
-      val v = new ObjectValue(tpe.typeSymbol, tpe)
-      (v, env.extend(v, new Object(ListMap())))
+      if (!tpe.typeSymbol.isJava) {
+        val v = new ObjectValue(tpe.typeSymbol, tpe)
+        (v, env.extend(v, new Object(ListMap())))
+      } else reflectInstance(tpe, env)
     }
     def module(mod: ModuleSymbol, env: Env): Result = {
       // create an interpreter value that corresponds to the object represented by the symbol
-      val value = new UninitializedModuleValue(mod)
-      (value, env.extend(mod, value))
+      // reflect java modules to call things like System.getenv() etc.
+      if (!mod.isJava) {
+        val value = new UninitializedModuleValue(mod)
+        (value, env.extend(mod, value))
+      } else reflectModule(mod, env)
     }
     def method(meth: MethodSymbol, env: Env): Result = {
       (MethodValue(meth, env), env)
