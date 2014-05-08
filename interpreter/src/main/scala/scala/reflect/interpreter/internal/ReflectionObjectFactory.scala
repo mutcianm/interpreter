@@ -36,10 +36,10 @@ trait ReflectionObjectFactory {
   class ReflectedMethod(val method: Symbol, parentInstance: Any, parentClass: Class[_]) extends CallableValue {
     val reflectedMethod = if(parentInstance!=null) {
       val types = method.typeSignature.paramLists.head.map(it=>TypeConverter.scalaToJava(it.typeSignature.typeSymbol))
-      parentInstance.getClass.getMethod(method.name.decoded, types:_*)
+      parentInstance.getClass.getMethod(method.name.decodedName.toString, types:_*)
     } else {
       val types: List[Class[_]] = method.typeSignature.paramLists.head.map(_.typeSignature.typeSymbol.asClass.asInstanceOf[Class[_]])
-      parentClass.getMethod(method.name.decoded, types: _*)
+      parentClass.getMethod(method.name.decodedName.toString, types: _*)
     }
     override def apply(args: List[Value], env: Env): (Value, Env) = {
       // return ReflectedObjectValue if call returns an object
@@ -68,8 +68,52 @@ trait ReflectionObjectFactory {
   class ReflectedModuleValue(sym: ModuleSymbol) extends ReflectedObjectValue(java.lang.Class.forName(sym.fullName), sym, sym.typeSignature) {
   }
 
+  class ReflectedScalaMethod(val method: MethodSymbol, parentValue: ReflectedScalaObject) extends CallableValue {
+    override def apply(args: List[Value], env: Env): (Value, Env) = {
+      val rr = ru.runtimeMirror(getClass.getClassLoader)
+      val valueMirror = rr.reflect(parentValue.instance)
+      val methodMirror = valueMirror.reflectMethod(method.asInstanceOf[ru.MethodSymbol])
+      val args1 = args.map(_.reify(env)._1)
+      val res = methodMirror.apply(args1:_*)
+      res match {
+        case x: java.lang.Byte => Value.reflect(x.toByte, env)
+        case x: java.lang.Short => Value.reflect(x.toShort, env)
+        case x: java.lang.Integer => Value.reflect(x.toInt, env)
+        case x: java.lang.Long => Value.reflect(x.toLong, env)
+        case x: java.lang.Float => Value.reflect(x.toFloat, env)
+        case x: java.lang.Double => Value.reflect(x.toDouble, env)
+        case x: java.lang.Boolean => Value.reflect(x.booleanValue(), env)
+        case x: java.lang.String => Value.reflect(x, env)
+        case null => Value.reflect(null, env)
+        case _    => (new WrappedScalaValue(res, rm.reflect(res).symbol.typeSignature.asInstanceOf[Type]) , env)
+      }
+      
+    }
+  }
+
+  class ReflectedScalaCtor(val method: MethodSymbol, parentValue: ReflectedScalaObject) extends CallableValue {
+    override def apply(args: List[Value], env: Env): (Value, Env) = {
+      val ctor = parentValue.cm.reflectConstructor(method.asInstanceOf[ru.MethodSymbol])
+      parentValue.instance = ctor(args.map(_.reify(env)._1):_*)
+      (parentValue, env)
+    }
+  }
+
+  class ReflectedScalaObject(tpe: Type) extends TypedValue(tpe) {
+    var instance: Any = null
+    val rr = ru.runtimeMirror(getClass.getClassLoader)
+    lazy val cm = rr.reflectClass(tpe.typeSymbol.asInstanceOf[ru.ClassSymbol])
+    override def select(member: Symbol, env: Env, static: Boolean): (Value, Env) = {
+      if (member.isConstructor) (new ReflectedScalaCtor(member.asMethod, this), env)
+      else if (member.isMethod) (new ReflectedScalaMethod(member.asMethod, this), env)
+      else ??? // TODO: fields
+    }
+  }
+
+  class WrappedScalaValue(inst: Any, tpe: Type) extends ReflectedScalaObject(tpe) { instance = inst }
+
   def reflectInstance(tpe: Type, env: Env): Result = {
-    ???
+    (new ReflectedScalaObject(tpe), env)
   }
 
   def reflectModule(mod: ModuleSymbol, env: Env): Result = {
