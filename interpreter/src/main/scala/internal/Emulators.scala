@@ -3,6 +3,7 @@ package internal
 
 import scala.collection.immutable.{ListMap, HashMap}
 import scala.collection.mutable
+import scala.runtime.BoxesRunTime
 
 trait Emulators {
   self: Engine =>
@@ -33,19 +34,23 @@ trait Emulators {
           val jresult = f(jvalue.asInstanceOf[T1])
           Value.reflect(jresult, env1)
         }
+        def invokePrimitiveMethod = {
+          val declaredMethods = classOf[BoxesRunTime].getDeclaredMethods
+          val jmeths = declaredMethods.filter(_.getName == toRuntimeName(sym.name))
+          assert(jmeths.length == 1, jmeths.toList)
+          val jmeth = jmeths.head
+          val result = jmeth.invoke(null, (value.reify(env)._1 +: args.map(_.reify(env)._1)).asInstanceOf[Seq[AnyRef]]: _*)
+          if (jmeth.getReturnType == java.lang.Void.TYPE) Value.reflect((), env)
+          else Value.reflectAny(result, env)
+        }
         def dummyOp = Value.reflect((), env)
         sym match {
-          case INT_PLUS_INT     => binOp[Int, Int](_ + _)
-          case INT_MINUS_INT    => binOp[Int, Int](_ - _)
-          case INT_LESS_INT     => binOp[Int, Int](_ < _)
-          case INT_GT_INT       => binOp[Int, Int](_ > _)
-          case INT_EQEQ_INT     => binOp[Int, Int](_ == _)
-          case INT_PLUS_FLOAT   => binOp[Int, Float](_ + _)
           case Any_equals       => binOp[Any, Any](_.equals(_))
           case Any_hashCode     => unaryOp[Any](_.hashCode())
           case Object_hashcode  => unaryOp[java.lang.Object](_.hashCode())
           case Object_init      => dummyOp
           case Throwable_init   => dummyOp
+          case sym if sym.owner.asClass.isPrimitive => invokePrimitiveMethod
           case other            => UnsupportedEmulation(sym)
         }
       }){ override def isNullary: Boolean = sym.asMethod.paramLists.isEmpty }

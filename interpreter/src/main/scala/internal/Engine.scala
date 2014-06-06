@@ -658,6 +658,22 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
       val value = new JvmValue(ev.tpe)
       (value, env.extend(value, any))
     }
+    def reflectAny(any: Any, env: Env): Result = {
+      any match {
+        case x: Byte                  => Value.reflect(x, env)
+        case x: Short                 => Value.reflect(x, env)
+        case x: Char                  => Value.reflect(x, env)
+        case x: Int                   => Value.reflect(x, env)
+        case x: Long                  => Value.reflect(x, env)
+        case x: Float                 => Value.reflect(x, env)
+        case x: Double                => Value.reflect(x, env)
+        case x: Boolean               => Value.reflect(x, env)
+        case x: Unit                  => Value.reflect(x, env)
+        case x: String                => Value.reflect(x, env)
+        case null                     => Value.reflect(null, env)
+        case _                        => IllegalState(any, s"$any is not a primitive")
+      }
+    }
     def function(params: List[Tree], body: Tree, env: Env): Result = {
       // wrap a function in an interpreter value using the provided lexical environment
       // note how useful it is that Env is immutable!
