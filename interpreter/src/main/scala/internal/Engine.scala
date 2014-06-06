@@ -629,11 +629,15 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
     }
     override def init(env: Env): (Value, Env) = {
       val v = new ModuleValue(mod)
-      val (_, env1) = collectFields(mod.typeSignature.baseClasses.filter(it => !it.isModuleClass && !it.isJava && it != AnyClass),
-        // point all parent symbol references to this instance and allocate object in heap
-        mod.typeSignature.baseClasses.foldLeft(env)((tmpEnv, s) => tmpEnv.extend(s, v)).extend(mod,v).extend(v, new Object(ListMap())))
-      val (_, env2) = eval(body, env1)
-      (v, env.extendHeap(env2))
+      if (env.heap.contains(this))
+        (v, env)
+      else {
+        val (_, env1) = collectFields(mod.typeSignature.baseClasses.filter(it => !it.isModuleClass && !it.isJava && it != AnyClass),
+          // point all parent symbol references to this instance and allocate object in heap
+          mod.typeSignature.baseClasses.foldLeft(env)((tmpEnv, s) => tmpEnv.extend(s, v)).extend(mod, v).extend(v, new Object(ListMap())))
+        val (_, env2) = eval(body, env1)
+        (v, env.extendHeap(env2))
+      }
     }
     override def toString = s"UninitializedModuleValue#" + id
   }
@@ -641,13 +645,8 @@ abstract class Engine extends InterpreterRequires with Definitions with Errors w
   class ModuleValue(val mod: ModuleSymbol) extends ObjectValue(mod, mod.typeSignature) {
     override def init(env: Env): Result = (this, env)
     override def toString = s"ModuleValue#" + id
-//    override def hashCode() = mod.hashCode()
-//    override def equals(obj: scala.Any): Boolean = {
-//      if (this == obj) return true
-//      if (obj == null) return false
-//      if (!obj.isInstanceOf[ModuleValue]) false
-//      else obj.asInstanceOf[ModuleValue].mod == this.mod
-//    }
+    override def hashCode() = mod.hashCode()
+    override def equals(obj: scala.Any) = obj.isInstanceOf[ModuleValue] && mod.equals(obj.asInstanceOf[ModuleValue].mod)
   }
 
   object Value {
