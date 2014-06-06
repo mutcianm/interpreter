@@ -37,4 +37,17 @@ class ExceptionSuite extends FunSuite {
     } == 42)
   }
 
+  test("exception caught by Throwable") {
+    assert(ctfe {
+      class A extends Throwable
+      class B extends Throwable
+      def f = {throw new A; 999}
+      def g = {f; 777}
+      try { g } catch {
+        case _:B           => 888
+        case _:Throwable   => 42
+      }
+    } == 42)
+  }
+
 }
