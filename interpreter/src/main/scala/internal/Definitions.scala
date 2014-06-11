@@ -7,6 +7,8 @@ trait Definitions {
   import u._
   import definitions._
 
+  lazy val ru = scala.reflect.runtime.universe.asInstanceOf[scala.reflect.internal.SymbolTable]
+
   lazy val Any_isInstanceOf = AnyClass.info.decl(TermName("isInstanceOf"))
   lazy val Any_equals = AnyClass.info.decl(TermName("equals"))
   lazy val Any_hashCode = AnyClass.info.decl(TermName("hashCode"))
@@ -16,42 +18,7 @@ trait Definitions {
   lazy val Option_isDefined = OptionClass.info.decl(TermName("isDefined"))
   lazy val Option_get = OptionClass.info.decl(TermName("get"))
 
-  // Primitive -> BoxesRuntime method mappings.
-  // TODO: rewrite using TermNames
-  lazy val runtimeNames = Map(
-  "*"   -> "multiply",
-  "+"   -> "add",
-  "-"   -> "subtract",
-  "/"   -> "divide",
-  ">>>" -> "shiftLogicalRight",
-  ">>"  -> "shiftLogicalRight",
-  "<<"  -> "shiftSignedLeft",
-  "%"   -> "takeModulo",
-  "=="  -> "testEqual",
-  "!="  -> "testNotEqual",
-  ">"   -> "testGreaterThan",
-  ">="  -> "testGreaterOrEqualThan",
-  "<"   -> "testLessThan",
-  "<="  -> "testLessOrEqualThan",
-  "&"   -> "takeAnd",
-  "|"   -> "takeOr",
-  "^"   -> "takeXor",
-  "&&"  -> "takeConditionalAnd",
-  "||"  -> "takeConditionalOr",
-  "unary_!" -> "takeNot",
-  "unary_+" -> "positive",
-  "unary_-" -> "negative",
-  "unary_~" -> "complement",
-  "toChar"  -> "toCharacter",
-  "toByte"  -> "toByte",
-  "toShort" -> "toShort",
-  "toInt"   -> "toInteger",
-  "toLong"  -> "toLong",
-  "toFloat" -> "toFloat",
-  "toDouble"-> "toDouble"
-  )
-
-  def toRuntimeName(in: Name): String = runtimeNames(in.decodedName.toString)
+  def toRuntimeName(in: Name): String = ru.nme.primitiveMethodName(ru.TermName(in.encodedName.toString)).toString
 
   private def method1[T1: TypeTag, T2: TypeTag](x1: T1, name: String, x2: T2): Symbol = {
     val (t1, t2) = (typeOf[T1].companion, typeOf[T2].companion)
